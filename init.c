@@ -126,6 +126,76 @@ static int is_linux_rootfs(void)
 	return 0;
 }
 
+/* Partition number of the vendor nvdata partition, 0 when this board has
+ * none (or it could not be identified). */
+static int nvdata_part;
+
+/*
+ * The vendor keeps per-device data on nvdata.  The one thing the kernel
+ * needs from there is the Bluetooth address: BT_Addr holds six bytes, the
+ * BD_ADDR most significant byte first, and btmtk_stp reads it back from
+ * the firmware directory.  Without it the driver declares the controller
+ * unconfigured, HCI initialisation stops after Read Local Version and
+ * features/MTU stay zero.
+ */
+static void copy_nvdata_blobs(void)
+{
+	char src[128], dst[160];
+	char buf[4096];
+	int in, out, n, total = 0;
+
+	if (!nvdata_part)
+		return;
+
+	mkdir("/nvdata", 0755);
+	snprintf(src, sizeof(src), "/dev/sdc%d", nvdata_part);
+	if (mount(src, "/nvdata", "ext4", MS_RDONLY, NULL)) {
+		int err = errno;
+
+		printf("  <nvdata mount failed: %s>\n", strerror(err));
+		fflush(stdout);
+		return;
+	}
+
+	snprintf(src, sizeof(src), "/nvdata/APCFG/APRDEB/BT_Addr");
+	in = open(src, O_RDONLY);
+	if (in < 0) {
+		int err = errno;
+
+		printf("  <no BT_Addr on nvdata: %s>\n", strerror(err));
+		fflush(stdout);
+		goto out;
+	}
+
+	mkdir("/rootfs/lib", 0755);
+	mkdir("/rootfs/lib/firmware", 0755);
+	mkdir("/rootfs/lib/firmware/mediatek", 0755);
+	mkdir("/rootfs/lib/firmware/mediatek/mt6833", 0755);
+
+	snprintf(dst, sizeof(dst),
+		 "/rootfs/lib/firmware/mediatek/mt6833/BT_Addr");
+	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out < 0) {
+		int err = errno;
+
+		printf("  <BT_Addr create failed: %s>\n", strerror(err));
+		fflush(stdout);
+	} else {
+		while ((n = read(in, buf, sizeof(buf))) > 0) {
+			if (write(out, buf, n) != n)
+				break;
+			total += n;
+		}
+		close(out);
+		printf("  BT_Addr -> %s (%d bytes)\n", dst, total);
+		fflush(stdout);
+	}
+	close(in);
+
+out:
+	umount("/nvdata");
+}
+
 /*
  * b264: hand control to a real rootfs -- the same sequence the
  * MT6895-Mainline reference init uses: bind the inner pseudo filesystems,
@@ -137,6 +207,13 @@ static int is_linux_rootfs(void)
  */
 static void switch_root_and_exec(void)
 {
+	/*
+	 * Device-unique bits live on the vendor nvdata partition, not in our
+	 * rootfs image.  Copy them across before the hand-over, while we still
+	 * know which partition they came from.
+	 */
+	copy_nvdata_blobs();
+
 	/*
 	 * b266/b267: keep the TOPRGU watchdog fed across the hand-over.
 	 * Alpine has no watchdog daemon yet, and silence trips the 31 s timer
@@ -233,9 +310,6 @@ static void probe_block_devices(void)
 	const char *fstypes[] = { "f2fs", "ext4" };
 	int i, fd, n, userdata = 0, rc;
 
-	printf("\n--- rootfs probe: UFS partitions ---\n");
-	fflush(stdout);
-
 	for (i = 1; i <= 64; i++) {
 		snprintf(path, sizeof(path), "/sys/class/block/sdc%d/uevent", i);
 		fd = open(path, O_RDONLY);
@@ -266,6 +340,8 @@ static void probe_block_devices(void)
 		 */
 		printf("  sdc%d %s\n", i, name);
 		fflush(stdout);
+		if (!strcmp(name, "nvdata"))
+			nvdata_part = i;
 		if (!strcmp(name, "userdata"))
 			userdata = i;
 	}
