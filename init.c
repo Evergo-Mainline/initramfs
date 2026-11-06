@@ -138,6 +138,67 @@ static int nvdata_part;
  * unconfigured, HCI initialisation stops after Read Local Version and
  * features/MTU stay zero.
  */
+/*
+ * Everything the connectivity stack requests lives in the initramfs
+ * /lib/firmware, which stops being visible the moment we MS_MOVE the real
+ * root over /.  It happens to work today only because conn_bringup() powers
+ * WiFi on here, while / is still the initramfs; anything that re-opens the
+ * device later (a WiFi toggle from the running system, a reload after a
+ * firmware assertion) would fail with -ENOENT.
+ *
+ * Mirror the files the same way the MT6895 reference init does.
+ */
+static const char *const rootfs_fw_files[] = {
+	"BT_FW.cfg",
+	"WIFI_RAM_CODE_soc2_2_1_1.bin",
+	"WMT_SOC.cfg",
+	"novatek_ts_ct_fw.bin",
+	"soc2_2_ram_bt_1_1_hdr.bin",
+	"soc2_2_ram_mcu_1_1_hdr.bin",
+	"soc2_2_ram_wifi_1_1_hdr.bin",
+	"wifi.cfg",
+};
+
+static void mirror_firmware_to_rootfs(void)
+{
+	char src[160], dst[160];
+	char buf[8192];
+	unsigned int i;
+	int in, out, n, copied = 0;
+
+	mkdir("/rootfs/lib", 0755);
+	mkdir("/rootfs/lib/firmware", 0755);
+
+	for (i = 0; i < sizeof(rootfs_fw_files) / sizeof(rootfs_fw_files[0]); i++) {
+		snprintf(src, sizeof(src), "/lib/firmware/%s", rootfs_fw_files[i]);
+		in = open(src, O_RDONLY);
+		if (in < 0)
+			continue;	/* revision-specific blobs may be absent */
+
+		snprintf(dst, sizeof(dst), "/rootfs/lib/firmware/%s",
+			 rootfs_fw_files[i]);
+		out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (out < 0) {
+			int err = errno;
+
+			printf("  <%s: %s>\n", dst, strerror(err));
+			fflush(stdout);
+			close(in);
+			continue;
+		}
+		while ((n = read(in, buf, sizeof(buf))) > 0) {
+			if (write(out, buf, n) != n)
+				break;
+		}
+		close(out);
+		close(in);
+		copied++;
+	}
+
+	printf("  firmware mirrored to rootfs: %d files\n", copied);
+	fflush(stdout);
+}
+
 static void copy_nvdata_blobs(void)
 {
 	char src[128], dst[160];
@@ -157,6 +218,11 @@ static void copy_nvdata_blobs(void)
 		return;
 	}
 
+	mkdir("/rootfs/lib", 0755);
+	mkdir("/rootfs/lib/firmware", 0755);
+	mkdir("/rootfs/lib/firmware/mediatek", 0755);
+	mkdir("/rootfs/lib/firmware/mediatek/mt6833", 0755);
+
 	snprintf(src, sizeof(src), "/nvdata/APCFG/APRDEB/BT_Addr");
 	in = open(src, O_RDONLY);
 	if (in < 0) {
@@ -164,35 +230,28 @@ static void copy_nvdata_blobs(void)
 
 		printf("  <no BT_Addr on nvdata: %s>\n", strerror(err));
 		fflush(stdout);
-		goto out;
-	}
-
-	mkdir("/rootfs/lib", 0755);
-	mkdir("/rootfs/lib/firmware", 0755);
-	mkdir("/rootfs/lib/firmware/mediatek", 0755);
-	mkdir("/rootfs/lib/firmware/mediatek/mt6833", 0755);
-
-	snprintf(dst, sizeof(dst),
-		 "/rootfs/lib/firmware/mediatek/mt6833/BT_Addr");
-	out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	if (out < 0) {
-		int err = errno;
-
-		printf("  <BT_Addr create failed: %s>\n", strerror(err));
-		fflush(stdout);
 	} else {
-		while ((n = read(in, buf, sizeof(buf))) > 0) {
-			if (write(out, buf, n) != n)
-				break;
-			total += n;
-		}
-		close(out);
-		printf("  BT_Addr -> %s (%d bytes)\n", dst, total);
-		fflush(stdout);
-	}
-	close(in);
+		snprintf(dst, sizeof(dst),
+			 "/rootfs/lib/firmware/mediatek/mt6833/BT_Addr");
+		out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+		if (out < 0) {
+			int err = errno;
 
-out:
+			printf("  <BT_Addr create failed: %s>\n", strerror(err));
+			fflush(stdout);
+		} else {
+			while ((n = read(in, buf, sizeof(buf))) > 0) {
+				if (write(out, buf, n) != n)
+					break;
+				total += n;
+			}
+			close(out);
+			printf("  BT_Addr -> %s (%d bytes)\n", dst, total);
+			fflush(stdout);
+		}
+		close(in);
+	}
+
 	umount("/nvdata");
 }
 
@@ -210,8 +269,15 @@ static void switch_root_and_exec(void)
 	/*
 	 * Device-unique bits live on the vendor nvdata partition, not in our
 	 * rootfs image.  Copy them across before the hand-over, while we still
-	 * know which partition they came from.
+	 * know which partition they came from.  The firmware mirror runs first
+	 * so the rootfs has the blobs the Bluetooth stack re-reads after
+	 * switch_root.
+	 *
+	 * Nothing WiFi-specific happens here: the MAC override this used to do
+	 * was measured not to take effect (wlan0 kept a random address), so it
+	 * was dropped rather than left in as a no-op that looks like it works.
 	 */
+	mirror_firmware_to_rootfs();
 	copy_nvdata_blobs();
 
 	/*
