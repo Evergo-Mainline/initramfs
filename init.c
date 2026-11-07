@@ -129,6 +129,7 @@ static int is_linux_rootfs(void)
 /* Partition number of the vendor nvdata partition, 0 when this board has
  * none (or it could not be identified). */
 static int nvdata_part;
+static void scan_partitions(void);   /* needs /dev/sdcN before copy_nvdata_blobs() */
 
 /*
  * The vendor keeps per-device data on nvdata.  The one thing the kernel
@@ -153,6 +154,14 @@ static const char *const rootfs_fw_files[] = {
 	"WIFI_RAM_CODE_soc2_2_1_1.bin",
 	"WMT_SOC.cfg",
 	"novatek_ts_ct_fw.bin",
+	/*
+	 * The running firmware the NT36672C asks request_firmware() for.  The
+	 * _ct_ one above is the config table and is built into the kernel via
+	 * CONFIG_EXTRA_FIRMWARE; this one is not, so without it the driver gives
+	 * up with -ENOENT and the controller ends up with no firmware at all
+	 * ("did NOT reach RESET_STATE_REK").
+	 */
+	"novatek_ts_fw.bin",
 	"soc2_2_ram_bt_1_1_hdr.bin",
 	"soc2_2_ram_mcu_1_1_hdr.bin",
 	"soc2_2_ram_wifi_1_1_hdr.bin",
@@ -278,6 +287,13 @@ static void switch_root_and_exec(void)
 	 * was dropped rather than left in as a no-op that looks like it works.
 	 */
 	mirror_firmware_to_rootfs();
+	/*
+	 * Build the /dev/sdcN nodes and find nvdata before copy_nvdata_blobs()
+	 * runs -- it has always returned immediately because nvdata_part was
+	 * still 0 at that point (only probe_block_devices() used to set it,
+	 * and that runs much later).
+	 */
+	scan_partitions();
 	copy_nvdata_blobs();
 
 	/*
@@ -291,43 +307,6 @@ static void switch_root_and_exec(void)
 	 * happened.  It survives exec of /sbin/init (only the main process
 	 * image is replaced).
 	 */
-	if (fork() == 0) {
-		char b[160];
-		int kfd = open("/dev/kmsg", O_WRONLY);
-		int fd = wdt_fd;		/* inherited from wdt_setup() */
-		int n, hb = 0;
-
-		if (fd < 0)
-			fd = open("/dev/watchdog", O_WRONLY);
-		if (kfd >= 0) {
-			n = snprintf(b, sizeof(b),
-				     "evergo: wdt-daemon up, fd=%d (init had %d)\n",
-				     fd, wdt_fd);
-			write(kfd, b, n);
-		}
-		for (;;) {
-			if (fd >= 0) {
-				int r = ioctl(fd, WDIOC_KEEPALIVE, 0);
-
-				if (kfd >= 0 && r < 0) {
-					n = snprintf(b, sizeof(b),
-						     "evergo: wdt-daemon KEEPALIVE failed: %s\n",
-						     strerror(errno));
-					write(kfd, b, n);
-				}
-			}
-			if (kfd >= 0 && (++hb % 6) == 0) {
-				struct timespec ts;
-
-				clock_gettime(CLOCK_BOOTTIME, &ts);
-				n = snprintf(b, sizeof(b),
-					     "evergo: wdt-daemon alive t=%lds\n",
-					     (long)ts.tv_sec);
-				write(kfd, b, n);
-			}
-			sleep(10);
-		}
-	}
 
 	mkdir("/rootfs/proc", 0755);
 	mkdir("/rootfs/sys", 0755);
@@ -370,11 +349,56 @@ static void switch_root_and_exec(void)
  * Linux rootfs (see is_linux_rootfs()) does b264 hand over control --
  * a stock encrypted Android userdata stays untouched.
  */
-static void probe_block_devices(void)
+static int userdata_part;
+
+/*
+ * Create /dev/sdcN, taking major:minor from sysfs.
+ *
+ * The initramfs cpio carries character nodes (console, kmsg, mem, null, zero,
+ * watchdog) but it cannot carry block nodes -- their major/minor depend on
+ * probe order.  devtmpfs would create them, except it never mounts on this
+ * board: devtmpfsd runs from driver_init() and immediately does
+ * init_mount(".", "/dev", MS_MOVE), which fails because the initramfs has not
+ * been unpacked yet, and init/main.c only falls back to prepare_namespace()
+ * when the ramdisk has no /init -- ours does.
+ *
+ * b377 listed every partition name correctly straight out of sysfs and then
+ * died at 'mount /dev/sdc58 as f2fs (ro): rc=-1 (No such file or directory)',
+ * which is exactly why the Alpine hand-over never happened.  This is the
+ * missing step.
+ */
+static int mknod_sdc(int n)
+{
+	char sys[64], dev[64], buf[32];
+	unsigned int maj = 0, min = 0;
+	int fd, len;
+
+	snprintf(sys, sizeof(sys), "/sys/class/block/sdc%d/dev", n);
+	fd = open(sys, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	len = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (len <= 0)
+		return -1;
+	buf[len] = 0;
+	if (sscanf(buf, "%u:%u", &maj, &min) != 2)
+		return -1;
+
+	snprintf(dev, sizeof(dev), "/dev/sdc%d", n);
+	unlink(dev);
+	return mknod(dev, S_IFBLK | 0600, makedev(maj, min));
+}
+
+/*
+ * Walk the partitions, create their nodes and remember which number is the
+ * vendor nvdata / Linux userdata.  Split out of probe_block_devices() because
+ * copy_nvdata_blobs() runs earlier and needs nvdata_part plus a real node.
+ */
+static void scan_partitions(void)
 {
 	char path[128], buf[512], *p, *nl, name[64];
-	const char *fstypes[] = { "f2fs", "ext4" };
-	int i, fd, n, userdata = 0, rc;
+	int i, fd, n;
 
 	for (i = 1; i <= 64; i++) {
 		snprintf(path, sizeof(path), "/sys/class/block/sdc%d/uevent", i);
@@ -399,27 +423,36 @@ static void probe_block_devices(void)
 			*nl = 0;
 		snprintf(name, sizeof(name), "%s", p);
 		/*
-		 * fflush every line: devkmsg_write() rejects any single write
-		 * over PRINTKRB_RECORD_MAX (1024 bytes) with -EINVAL and glibc
-		 * then drops the whole buffered block.  b262 lost this list and
-		 * the mount results that way (a ~1.2 KB single flush).
+		 * fflush every line: devkmsg_write() rejects any single write over
+		 * PRINTKRB_RECORD_MAX (1024 bytes) with -EINVAL and glibc then drops
+		 * the whole buffered block.  b262 lost this list and the mount
+		 * results that way (a ~1.2 KB single flush).
 		 */
-		printf("  sdc%d %s\n", i, name);
+		printf("  sdc%d %s%s\n", i, name, mknod_sdc(i) ? " [no node]" : "");
 		fflush(stdout);
 		if (!strcmp(name, "nvdata"))
 			nvdata_part = i;
 		if (!strcmp(name, "userdata"))
-			userdata = i;
+			userdata_part = i;
 	}
+}
 
-	if (!userdata) {
+static void probe_block_devices(void)
+{
+	char path[128];
+	const char *fstypes[] = { "f2fs", "ext4" };
+	int i, rc;
+
+	scan_partitions();
+
+	if (!userdata_part) {
 		printf("  <no userdata partition found>\n");
 		fflush(stdout);
 		return;
 	}
 
 	mkdir("/rootfs", 0755);
-	snprintf(path, sizeof(path), "/dev/sdc%d", userdata);
+	snprintf(path, sizeof(path), "/dev/sdc%d", userdata_part);
 
 	/*
 	 * Peek at the first 64 bytes before mounting.  The kernel already
@@ -642,6 +675,77 @@ static void conn_launcher(void)
 	}
 }
 
+/*
+ * Create a /dev node for a character driver that took its major from
+ * alloc_chrdev_region().
+ *
+ * Third instance of the same problem (see pmsg_mknod and mknod_sdc): the major
+ * is handed out at probe time, so the node cannot live in the cpio.
+ * "wmtdetect" is the one that hurts: wmt_detect_driver_init() announces
+ * "driver(major 154) installed", conn_bringup() then fails at
+ * open("/dev/wmtdetect") with ENOENT, CONN never powers up, and wlan keeps
+ * reporting "CONN EMI window not published yet, deferring" for the whole boot.
+ */
+/*
+ * Create /dev/<name> for a character driver that does not register through
+ * devtmpfs (which never mounts here) and whose /dev node udev would only make
+ * much later (init runs at ~1.5 s, udev at ~17 s).
+ *
+ * Two lookups, in order:
+ *
+ *  1. sysfs  /sys/class/<name>/<name>/dev -- what device_create() publishes.
+ *     This is the one that matters for wmtdetect: the driver registers its
+ *     chrdev region under "mtk_wcn_detect" (WMT_DETECT_DRVIER_NAME) but names
+ *     the device "wmtdetect", so the /proc/devices lookup below can never
+ *     match it.
+ *  2. /proc/devices by name -- for drivers that only call register_chrdev().
+ */
+static int mknod_chr_dynamic(const char *name, int minor)
+{
+	char path[160], dev[64], buf[32];
+	unsigned int maj = 0, min = 0;
+	FILE *f;
+	char line[128];
+	int fd, len, found = 0;
+
+	snprintf(path, sizeof(path), "/sys/class/%s/%s/dev", name, name);
+	fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		len = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (len > 0) {
+			buf[len] = 0;
+			if (sscanf(buf, "%u:%u", &maj, &min) == 2)
+				found = 1;
+		}
+	}
+
+	if (!found) {
+		f = fopen("/proc/devices", "r");
+		if (!f)
+			return -1;
+		while (fgets(line, sizeof(line), f)) {
+			char n[64];
+			int m;
+
+			if (sscanf(line, "%d %63s", &m, n) == 2 && !strcmp(n, name)) {
+				maj = m;
+				min = minor;
+				found = 1;
+				break;
+			}
+		}
+		fclose(f);
+	}
+
+	if (!found)
+		return -1;
+
+	snprintf(dev, sizeof(dev), "/dev/%s", name);
+	unlink(dev);
+	return mknod(dev, S_IFCHR | 0600, makedev(maj, min));
+}
+
 static void conn_bringup(void)
 {
 	int fd, chip;
@@ -650,6 +754,10 @@ static void conn_bringup(void)
 	fflush(stdout);
 
 	fd = open("/dev/wmtdetect", O_RDWR);
+	if (fd < 0) {
+		mknod_chr_dynamic("wmtdetect", 0);
+		fd = open("/dev/wmtdetect", O_RDWR);
+	}
 	if (fd < 0) {
 		printf("  <no /dev/wmtdetect: %s>\n", strerror(errno));
 		fflush(stdout);
@@ -1913,9 +2021,71 @@ static void pmsg_put(const char *s)
 	}
 }
 
+/*
+ * /dev/pmsg0 is a misc device: its minor is assigned at probe time, so it
+ * cannot be packed into the cpio the way console/kmsg are.  Create it from
+ * /proc/misc.  Without this the black box has never been armed on any boot
+ * ("cannot open /dev/pmsg0"), even though the DTS reserves
+ * pmsg-size = 0x10000 for exactly this purpose.
+ */
+/*
+ * Create the /dev/pmsg0 node.
+ *
+ * This tree does not use the upstream misc device: pstore_register_pmsg()
+ * in fs/pstore/pmsg.c does register_chrdev() + class_create("pmsg") +
+ * device_create(..., "pmsg0"), so the authoritative description lives at
+ * /sys/class/pmsg/pmsg0/dev with a dynamically allocated major number.
+ * Looking for it in /proc/misc under the names "pmsg" / "pmsg0" -- which is
+ * what this code used to do -- can never match, so the black box stayed off
+ * on every boot ("pmsg: cannot open /dev/pmsg0 - black box off").
+ *
+ * Keep the misc paths as fallbacks in case the module is ever switched back
+ * to the upstream implementation.
+ */
+static const char *const pmsg_sysfs[] = {
+	"/sys/class/pmsg/pmsg0/dev",
+	"/sys/class/misc/pmsg/dev",
+	"/sys/class/misc/pmsg0/dev",
+};
+
+static void pmsg_mknod(void)
+{
+	char buf[32];
+	unsigned int maj, min;
+	int i, fd, len;
+
+	if (access("/dev/pmsg0", F_OK) == 0)
+		return;
+
+	for (i = 0; i < (int)(sizeof(pmsg_sysfs) / sizeof(pmsg_sysfs[0])); i++) {
+		fd = open(pmsg_sysfs[i], O_RDONLY);
+		if (fd < 0)
+			continue;
+		len = read(fd, buf, sizeof(buf) - 1);
+		close(fd);
+		if (len <= 0)
+			continue;
+		buf[len] = 0;
+		if (sscanf(buf, "%u:%u", &maj, &min) != 2)
+			continue;
+
+		unlink("/dev/pmsg0");
+		if (mknod("/dev/pmsg0", S_IFCHR | 0220, makedev(maj, min)) == 0)
+			return;
+	}
+}
+
 static void pmsg_open(void)
 {
 	pmsg_fd = open("/dev/pmsg0", O_WRONLY | O_NONBLOCK);
+	if (pmsg_fd < 0)
+		pmsg_fd = open("/dev/pmsg", O_WRONLY | O_NONBLOCK);
+	if (pmsg_fd < 0) {
+		pmsg_mknod();
+		pmsg_fd = open("/dev/pmsg", O_WRONLY | O_NONBLOCK);
+		if (pmsg_fd < 0)
+			pmsg_fd = open("/dev/pmsg0", O_WRONLY | O_NONBLOCK);
+	}
 	if (pmsg_fd < 0)
 		printf("[evergo] pmsg: cannot open /dev/pmsg0 (%s) - black box off\n",
 		       strerror(errno));
@@ -2268,7 +2438,7 @@ static void console_pump(void)
 	if (gs_fd < 0)
 		return;
 
-	if (pump_ticks % 25 == 0 || !host_present)
+	if (pump_ticks % 100 == 0 || !host_present)
 		host_present = gs_host();
 	if (host_present && !had_host) {
 		printf("[evergo] usb host configured\n");
@@ -2384,7 +2554,7 @@ static void console_pump(void)
 	}
 
 	pump_ticks++;
-	if (pump_ticks % 25 == 0)	/* ~5 s: persistent heartbeat */
+	if (pump_ticks % 100 == 0)	/* ~5 s: persistent heartbeat */
 		hb_emit();
 	if (pump_ticks % 50 == 0)	/* ~10 s: keep the 31 s WDT away */
 		wdt_ping();
@@ -2531,13 +2701,107 @@ int main(void)
 	/* one big write() per flush keeps /dev/kmsg happy */
 	setvbuf(stdout, stdout_buf, _IOFBF, sizeof(stdout_buf));
 
+	/*
+	 * /dev is already populated: the device nodes are packed into the
+	 * initramfs cpio by build_boot.py, because nothing else can create
+	 * them here.  CONFIG_DEVTMPFS_MOUNT only arranges for
+	 * devtmpfs_mount() to run from prepare_namespace(), and init/main.c
+	 * calls that *only* when the ramdisk has no /init -- which ours has.
+	 *
+	 * Do NOT try mount("devtmpfs", "/dev", ...) as a workaround: on this
+	 * board it blocks forever.  b373 proved it -- the board went into a
+	 * boot loop with no panic record at all, so its exit() never ran.
+	 * Even if it returned, devtmpfs is a fresh empty instance (devtmpfsd
+	 * died at driver_init() because /dev did not exist yet), so it would
+	 * only shadow the nodes the cpio just created.
+	 */
+
+	/*
+	 * Bootstrap the log channel.  Harmless if devtmpfs came up; essential if
+	 * it did not, because then the hand-made node is the only way to say
+	 * anything at all.
+	 */
+	mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11));
+	mknod("/dev/mem", S_IFCHR | 0600, makedev(1, 1));
+	mknod("/dev/watchdog", S_IFCHR | 0600, makedev(10, 130));
+	kmsg = open("/dev/kmsg", O_WRONLY);
+	if (kmsg >= 0) {
+		dup2(kmsg, 1);
+		dup2(kmsg, 2);
+		close(kmsg);
+	}
+
+	printf("\n\n=== evergo bring-up init [b375: cpio-dev] ===\n");
+	fflush(stdout);
+
+	printf("[evergo] mount proc...\n");
+	fflush(stdout);
 	if (mount("proc", "/proc", "proc", 0, NULL))
 		printf("mount /proc: %s\n", strerror(errno));
+	printf("[evergo] mount sysfs...\n");
+	fflush(stdout);
 	if (mount("sysfs", "/sys", "sysfs", 0, NULL))
 		printf("mount /sys: %s\n", strerror(errno));
-	if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL))
-		printf("mount /dev: %s\n", strerror(errno));
+	printf("[evergo] proc and sysfs mounted; /dev came from the cpio\n");
+	fflush(stdout);
 	mkdir("/sys/kernel/debug", 0755);
+
+	/*
+	 * Nobody feeds the 31 s TOPRGU watchdog that setup.c arms, so the board
+	 * resets itself on a timer; take it over here, before the pstore mount,
+	 * which is the longest blocking step this early (see wdt_setup).
+	 */
+	wdt_setup();
+
+	/*
+	 * Feed the dog from here on, not after the rootfs work below.
+	 *
+	 * b376 showed why: console_start() reported "live on /dev/ttyGS0"
+	 * at 1.973 s and then nothing more was printed for thirty
+	 * seconds, because usb_bringup() (the very next call) never
+	 * returned.  The daemon used to be forked way down past
+	 * mirror_firmware_to_rootfs()/copy_nvdata_blobs(), so nobody fed
+	 * the 31 s TOPRGU timer and the board reset with the real reason
+	 * never recorded.  Forking it here means any later stall is just
+	 * a stall, and the log stays readable.
+	 */
+	if (fork() == 0) {
+		char b[160];
+		int kfd = open("/dev/kmsg", O_WRONLY);
+		int fd = wdt_fd;		/* inherited from wdt_setup() */
+		int n, hb = 0;
+
+		if (fd < 0)
+			fd = open("/dev/watchdog", O_WRONLY);
+		if (kfd >= 0) {
+			n = snprintf(b, sizeof(b),
+				     "evergo: wdt-daemon up, fd=%d (init had %d)\n",
+				     fd, wdt_fd);
+			write(kfd, b, n);
+		}
+		for (;;) {
+			if (fd >= 0) {
+				int r = ioctl(fd, WDIOC_KEEPALIVE, 0);
+
+				if (kfd >= 0 && r < 0) {
+					n = snprintf(b, sizeof(b),
+						     "evergo: wdt-daemon KEEPALIVE failed: %s\n",
+						     strerror(errno));
+					write(kfd, b, n);
+				}
+			}
+			if (kfd >= 0 && (++hb % 6) == 0) {
+				struct timespec ts;
+
+				clock_gettime(CLOCK_BOOTTIME, &ts);
+				n = snprintf(b, sizeof(b),
+					     "evergo: wdt-daemon alive t=%lds\n",
+					     (long)ts.tv_sec);
+				write(kfd, b, n);
+			}
+			sleep(10);
+		}
+	}
 
 	/*
 	 * Everything from here on goes through printk.  console=tty0 is in the
@@ -2571,11 +2835,6 @@ int main(void)
 	    errno != EBUSY)
 		printf("mount pstore: %s\n", strerror(errno));
 
-	/*
-	 * Nobody feeds the 31 s TOPRGU watchdog that setup.c arms, so the
-	 * board resets itself on a timer; take it over (see wdt_setup).
-	 */
-	wdt_setup();
 	if (mount("debugfs", "/sys/kernel/debug", "debugfs", 0, NULL) &&
 	    errno != EBUSY)
 		printf("mount debugfs: %s\n", strerror(errno));
@@ -2683,9 +2942,16 @@ int main(void)
 				break;
 		}
 	}
+	/*
+	 * 50 ms, not 200 ms.  At 200 ms the kernel produced log faster than
+	 * this loop could drain /dev/kmsg, so the printk ring wrapped and
+	 * dump_backlog() kept reporting lost=635 out of ~65k bytes -- the
+	 * interesting lines were exactly the ones being dropped.  Four times
+	 * the poll rate costs nothing measurable on an idle bring-up image.
+	 */
 	for (;;) {
 		console_pump();
-		usleep(200000);
+		usleep(50000);
 	}
 
 	return 0;
